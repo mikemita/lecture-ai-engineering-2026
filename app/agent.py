@@ -14,9 +14,10 @@
 import argparse
 import inspect
 import json
+from collections.abc import Callable
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolApproved
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -32,17 +33,20 @@ INSTRUCTIONS = """\
 あなたはAIエンジニアリング講座（AIE2026）の学習支援エージェントです。
 - 用語や講座に固有のことを答える前に、必ず search_glossary で用語集を確認する。
 - 回の内容を聞かれたら get_lecture_summary を使う。
+- 確認問題を出すときは、make_quiz の question と answer を両方表示し、利用者の回答を待つ案内はしない。
+- 学習記録の保存を依頼されたら save_learning_log が利用可能な場合のみ使い、利用できない場合は未対応と伝える。
+- save_learning_log の結果が「The tool call was denied.」なら、機能が利用できないのではなく利用者が保存を拒否したという意味。保存は行われていないと伝える。
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(instructions=INSTRUCTIONS, output_type=str | DeferredToolRequests)
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
-
-# TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+agent.tool_plain(tools.make_quiz)
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -73,7 +77,11 @@ def load_mcp_servers(config_path: Path = MCP_CONFIG) -> list[MCPToolset]:
 
 def build_mcp_agent(config_path: Path = MCP_CONFIG) -> Agent:
     """第5回: 関数を直接登録する代わりに、MCP サーバーが公開するツールを使うエージェント。INSTRUCTIONS は同じ。"""
-    return Agent(instructions=INSTRUCTIONS, toolsets=load_mcp_servers(config_path))
+    return Agent(
+        instructions=INSTRUCTIONS,
+        output_type=str | DeferredToolRequests,
+        toolsets=load_mcp_servers(config_path),
+    )
 
 
 def build_model() -> GoogleModel:
@@ -109,6 +117,51 @@ def print_trace(result) -> None:
     print(f"[usage] {result.usage}")
 
 
+def run_with_approval(
+    target: Agent,
+    question: str,
+    model_factory: Callable[[], GoogleModel | TestModel],
+):
+    """承認が必要なツールを利用者に確認してから実行し、会話を再開する。"""
+    result = target.run_sync(question, model=model_factory())
+    while isinstance(result.output, DeferredToolRequests):
+        requests = result.output
+        if requests.calls:
+            raise RuntimeError("外部実行が必要なツール要求には対応していません。")
+
+        approvals = {}
+        for call in requests.approvals:
+            print(f"\n{call.tool_name} の実行には承認が必要です。")
+            print(json.dumps(call.args_as_dict(), ensure_ascii=False, indent=2))
+            answer = input("この内容を実行しますか？ [y/N]: ").strip().lower()
+            approvals[call.tool_call_id] = ToolApproved() if answer in {"y", "yes"} else False
+
+        result = target.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=DeferredToolResults(approvals=approvals),
+            model=model_factory(),
+        )
+    return result
+
+
+def format_response(result) -> str:
+    """保存が拒否された場合、モデルの誤解に依存せず正確な結果を伝える。"""
+    tool_returns = [
+        part
+        for message in result.all_messages()
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.tool_name == "save_learning_log"
+    ]
+    was_denied = any(part.content == "The tool call was denied." for part in tool_returns)
+    was_saved = any(
+        isinstance(part.content, str) and part.content.startswith("学習記録を ")
+        for part in tool_returns
+    )
+    if was_denied and not was_saved:
+        return "学習記録の保存はキャンセルされました。学習記録は保存されていません。"
+    return str(result.output)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="学習支援エージェントに質問する")
     parser.add_argument("question", nargs="?")
@@ -128,11 +181,11 @@ def main() -> None:
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = run_with_approval(target, args.question, build_model)
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
-    print(result.output)
+    print(format_response(result))
     if args.trace:
         print_trace(result)
 

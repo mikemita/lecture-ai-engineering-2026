@@ -39,6 +39,42 @@ def test_lecture_summary():
     assert "まだありません" in tools.get_lecture_summary(99)
 
 
+def test_make_quiz_returns_question_and_answer_for_lecture():
+    quiz = json.loads(tools.make_quiz(2))
+
+    assert set(quiz) == {"question", "answer"}
+    assert quiz["question"].startswith("「")
+    assert quiz["question"].endswith("」の意味は？")
+    assert quiz["answer"]
+
+
+def test_make_quiz_reports_when_lecture_has_no_terms():
+    assert "第99回の用語が見つかりませんでした。" == tools.make_quiz(99)
+
+
+def test_save_learning_log_creates_new_markdown_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "LEARNING_LOG_DIR", tmp_path / "learning_log")
+
+    result = tools.save_learning_log("  今日学んだこと  ")
+
+    files = list((tmp_path / "learning_log").glob("*.md"))
+    assert len(files) == 1
+    assert files[0].read_text(encoding="utf-8") == "今日学んだこと\n"
+    assert str(files[0].relative_to(tmp_path)) in result
+
+
+def test_save_learning_log_rejects_empty_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "LEARNING_LOG_DIR", tmp_path / "learning_log")
+
+    try:
+        tools.save_learning_log("  ")
+    except ValueError as exc:
+        assert "空です" in str(exc)
+    else:
+        raise AssertionError("空の学習記録は保存できません")
+    assert not (tmp_path / "learning_log").exists()
+
+
 def test_default_question_of_lecture1_is_answerable_from_glossary():
     """第1回の既定の質問（app.ask）は、第3回のエージェントが用語集で正しく答えられること。"""
     from app.ask import DEFAULT_QUESTION

@@ -5,11 +5,14 @@ TestModel は実際のLLMを呼ばない偽モデルで、登録されたツー�
 「ツールが登録され、呼ばれ、結果がモデルに戻るか」を確かめられる。
 """
 
+import builtins
+
 from pydantic_ai import DeferredToolRequests
 from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 from pydantic_ai.models.test import TestModel
 
-from app.agent import agent
+from app import tools
+from app.agent import agent, format_response, run_with_approval
 
 BASE_TOOLS = {"search_glossary", "get_lecture_summary"}
 
@@ -40,3 +43,37 @@ def test_glossary_result_reaches_the_model():
         result = agent.run_sync("RAGとは？")
     returns = _parts(result, ToolReturnPart)
     assert returns and returns[0].tool_name == "search_glossary"
+
+
+def test_save_learning_log_waits_for_approval(tmp_path, monkeypatch):
+    log_dir = tmp_path / "learning_log"
+    monkeypatch.setattr(tools, "LEARNING_LOG_DIR", log_dir)
+    models = iter([TestModel(call_tools=["save_learning_log"]), TestModel(call_tools=[])])
+
+    def approve(prompt):
+        assert not log_dir.exists()
+        return "y"
+
+    monkeypatch.setattr(builtins, "input", approve)
+    result = run_with_approval(agent, "学習記録を保存して", lambda: next(models))
+
+    files = list(log_dir.glob("*.md"))
+    assert len(files) == 1
+    assert files[0].read_text(encoding="utf-8").strip()
+    assert result.output
+
+
+def test_save_learning_log_is_not_written_when_denied(tmp_path, monkeypatch):
+    log_dir = tmp_path / "learning_log"
+    monkeypatch.setattr(tools, "LEARNING_LOG_DIR", log_dir)
+    models = iter([TestModel(call_tools=["save_learning_log"]), TestModel(call_tools=[])])
+    monkeypatch.setattr(builtins, "input", lambda prompt: "n")
+
+    result = run_with_approval(agent, "学習記録を保存して", lambda: next(models))
+
+    assert not log_dir.exists()
+    returns = _parts(result, ToolReturnPart)
+    assert any(part.content == "The tool call was denied." for part in returns)
+    assert format_response(result) == (
+        "学習記録の保存はキャンセルされました。学習記録は保存されていません。"
+    )
