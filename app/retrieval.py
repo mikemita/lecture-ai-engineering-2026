@@ -135,7 +135,84 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        return expand_search_results([dict(row) for row in rows])
+
+
+def expand_search_results(hits: list[dict], pages: list[dict] | None = None) -> list[dict]:
+    """一致ページの前後1ページを、資料をまたがないように重複排除して返す。"""
+    if not hits:
+        return []
+
+    all_pages = pages if pages is not None else load_pages(RAG_SOURCE)
+    document_pages = defaultdict(list)
+    page_by_id = {}
+    for page in all_pages:
+        document_pages[page["document_id"]].append(page)
+        page_by_id[page["page_id"]] = page
+
+    document_positions = {
+        document_id: {page["page_id"]: index for index, page in enumerate(document)}
+        for document_id, document in document_pages.items()
+    }
+
+    results = []
+    seen = set()
+    for hit in hits:
+        page_id = hit["page_id"]
+        document_id = hit["document_id"]
+        source_page = page_by_id.get(page_id)
+        if source_page is None or source_page["content"] != hit.get("content"):
+            if page_id not in seen:
+                seen.add(page_id)
+                results.append({**hit, "is_seed": True})
+            continue
+        document = document_pages.get(document_id, [])
+        position = document_positions.get(document_id, {}).get(page_id)
+
+        previous = document[position - 1] if position is not None and position > 0 else None
+        next_page = document[position + 1] if position is not None and position + 1 < len(document) else None
+        context_pages = [page for page in (previous, next_page) if page is not None]
+        context_text = "\n\n".join(
+            page["content"]
+            for page in (previous, hit, next_page)
+            if page is not None
+        )
+
+        enriched_hit = {
+            **hit,
+            "is_seed": True,
+            "previous_page": dict(previous) if previous is not None else None,
+            "next_page": dict(next_page) if next_page is not None else None,
+            "context_pages": [dict(page) for page in context_pages],
+            "context": context_text,
+        }
+        candidates = [(enriched_hit if page_id == hit["page_id"] else None)] + [
+            page for page in (previous, next_page) if page is not None
+        ]
+
+        matched_added = False
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            candidate_id = candidate["page_id"]
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            if candidate_id == page_id:
+                results.append(enriched_hit)
+                matched_added = True
+            else:
+                neighbor = dict(candidate)
+                neighbor["is_neighbor"] = True
+                if "distance" in hit:
+                    neighbor["distance"] = hit["distance"]
+                results.append(neighbor)
+
+        if not matched_added and page_id not in seen:
+            seen.add(page_id)
+            results.append(enriched_hit)
+
+    return results
 
 
 def search_graph(query: str) -> dict:
@@ -151,7 +228,10 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    seeds = [
+        hit for hit in search(query)
+        if hit["page_id"] in pages and not hit.get("is_neighbor")
+    ][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
