@@ -54,3 +54,35 @@ def test_existing_index_survives_failed_rebuild(materials):
         build_index(source, database, rebuild=True, embedder=embed)
     assert database.read_bytes() == before
     assert not list(database.parent.glob(".rag-build-*"))
+
+
+def test_search_results_include_unique_neighbor_pages(monkeypatch):
+    pages = [
+        {"page_id": "lec01-main-p001", "document_id": "lec01-main", "lecture": 1,
+         "document_title": "講義1", "section": "章", "title": "p1",
+         "page": 1, "content": "本文1"},
+        {"page_id": "lec01-main-p002", "document_id": "lec01-main", "lecture": 1,
+         "document_title": "講義1", "section": "章", "title": "p2",
+         "page": 2, "content": "本文2"},
+        {"page_id": "lec01-main-p003", "document_id": "lec01-main", "lecture": 1,
+         "document_title": "講義1", "section": "章", "title": "p3",
+         "page": 3, "content": "本文3"},
+        {"page_id": "lec02-main-p001", "document_id": "lec02-main", "lecture": 2,
+         "document_title": "講義2", "section": "章", "title": "p1",
+         "page": 1, "content": "別資料"},
+    ]
+    hits = [
+        {**pages[1], "distance": 0.1},
+        {**pages[0], "distance": 0.2},
+    ]
+
+    results = retrieval.expand_search_results(hits, pages)
+
+    assert [result["page_id"] for result in results] == [
+        "lec01-main-p002",
+        "lec01-main-p001",
+        "lec01-main-p003",
+    ]
+    assert len(results) == len({result["page_id"] for result in results})
+    assert "本文1" in results[0]["context"]
+    assert "本文3" in results[0]["context"]
